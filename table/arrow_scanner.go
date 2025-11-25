@@ -138,12 +138,12 @@ func readAllDeleteFiles(ctx context.Context, fs iceio.IO, tasks []FileScanTask, 
 
 				// Merge if data file already has deletes from another Parquet file
 				if existing, ok := deletePerFiles[dataFilePath]; ok {
-					existingSet := existing.(*SetPositionDeleteIndex)
+					existingIdx := existing.(*ParquetPositionDeleteIndex)
 					for pos := range positions {
-						existingSet.positions[pos] = struct{}{}
+						existingIdx.positions[pos] = struct{}{}
 					}
 				} else {
-					deletePerFiles[dataFilePath] = &SetPositionDeleteIndex{positions: positions}
+					deletePerFiles[dataFilePath] = &ParquetPositionDeleteIndex{positions: positions}
 				}
 			}
 			return nil

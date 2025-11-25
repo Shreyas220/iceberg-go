@@ -47,21 +47,23 @@ type PositionDeleteIndex interface {
 	Release()
 }
 
-type SetPositionDeleteIndex struct {
+// ParquetPositionDeleteIndex implements PositionDeleteIndex using a hash map.
+// Used for position deletes loaded from Parquet delete files.
+type ParquetPositionDeleteIndex struct {
 	positions map[int64]struct{}
 }
 
-func (idx *SetPositionDeleteIndex) Contains(pos int64) bool {
+func (idx *ParquetPositionDeleteIndex) Contains(pos int64) bool {
 	_, ok := idx.positions[pos]
 	return ok
 }
 
-func (idx *SetPositionDeleteIndex) IsEmpty() bool {
+func (idx *ParquetPositionDeleteIndex) IsEmpty() bool {
 	return len(idx.positions) == 0
 }
 
-func (idx *SetPositionDeleteIndex) Release() {
-	// No-op for map
+func (idx *ParquetPositionDeleteIndex) Release() {
+	// No-op: Go's GC handles map cleanup
 }
 
 // RoaringPositionDeleteIndex implements PositionDeleteIndex using Roaring Bitmaps.
