@@ -1547,6 +1547,7 @@ const (
 	AvroFile    FileFormat = "AVRO"
 	OrcFile     FileFormat = "ORC"
 	ParquetFile FileFormat = "PARQUET"
+	PuffinFile  FileFormat = "PUFFIN"
 )
 
 type colMap[K, V any] struct {
@@ -2066,11 +2067,17 @@ func NewDataFileBuilder(
 		return nil, fmt.Errorf("%w: path cannot be empty", ErrInvalidArgument)
 	}
 
-	if format != AvroFile && format != OrcFile && format != ParquetFile {
+	if format != AvroFile && format != OrcFile && format != ParquetFile && format != PuffinFile {
 		return nil, fmt.Errorf(
-			"%w: format must be one of %s, %s, or %s",
-			ErrInvalidArgument, AvroFile, OrcFile, ParquetFile,
+			"%w: format must be one of %s, %s, %s, or %s",
+			ErrInvalidArgument, AvroFile, OrcFile, ParquetFile, PuffinFile,
 		)
+	}
+
+	if format == PuffinFile {
+		if content != EntryContentPosDeletes {
+			return nil, fmt.Errorf("%w: puffin format can only be used for positional deletes", ErrInvalidArgument)
+		}
 	}
 
 	if recordCount <= 0 {

@@ -43,60 +43,118 @@ const (
 )
 
 type (
-	positionDeletes   = []*arrow.Chunked
-	perFilePosDeletes = map[string]positionDeletes
+	perFilePosDeletes = map[string]PositionDeleteIndex
 )
 
 func readAllDeleteFiles(ctx context.Context, fs iceio.IO, tasks []FileScanTask, concurrency int) (perFilePosDeletes, error) {
-	var (
-		deletesPerFile = make(perFilePosDeletes)
-		uniqueDeletes  = make(map[string]iceberg.DataFile)
-		err            error
-	)
 
-	for _, t := range tasks {
-		for _, d := range t.DeleteFiles {
-			if d.ContentType() != iceberg.EntryContentPosDeletes {
+	// read all the delete files by format
+	// parpuet and puffin
+	parquetDeleteFiles := make(map[string]iceberg.DataFile)
+	puffinDV := make(map[string]iceberg.DataFile)
+
+	for _, task := range tasks {
+		for _, deleteFile := range task.DeleteFiles {
+			switch deleteFile.ContentType() {
+			case iceberg.EntryContentPosDeletes:
+				switch deleteFile.FileFormat() {
+				case iceberg.ParquetFile:
+					parquetDeleteFiles[deleteFile.FilePath()] = deleteFile
+				case iceberg.PuffinFile:
+					if ref := deleteFile.ReferencedDataFile(); ref != nil {
+						puffinDV[*ref] = deleteFile
+					}
+				}
+			case iceberg.EntryContentEqDeletes:
+				println("eq deletes not supported")
 				continue
 			}
-
-			if _, ok := uniqueDeletes[d.FilePath()]; !ok {
-				uniqueDeletes[d.FilePath()] = d
-			}
 		}
 	}
-
-	if len(uniqueDeletes) == 0 {
-		return deletesPerFile, nil
+	// return early if nothing to be deleted
+	if len(parquetDeleteFiles) == 0 && len(puffinDV) == 0 {
+		return make(perFilePosDeletes), nil
 	}
 
+	deletePerFiles := make(perFilePosDeletes)
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(concurrency)
+	var mu sync.Mutex
 
-	perFileChan := make(chan map[string]*arrow.Chunked, concurrency)
-	go func() {
-		defer close(perFileChan)
-		for _, v := range uniqueDeletes {
-			g.Go(func() error {
-				deletes, err := readDeletes(ctx, fs, v)
-				if deletes != nil {
-					perFileChan <- deletes
-				}
-
+	// Phase 1: Load Puffin DVs first (they take priority over Parquet pos deletes)
+	for dataFilePath, df := range puffinDV {
+		df := df
+		dataFilePath := dataFilePath
+		g.Go(func() error {
+			idx, err := LoadDVIndex(ctx, fs, df)
+			if err != nil {
 				return err
-			})
-		}
+			}
 
-		err = g.Wait()
-	}()
+			mu.Lock()
+			deletePerFiles[dataFilePath] = idx
+			mu.Unlock()
 
-	for deletes := range perFileChan {
-		for file, arr := range deletes {
-			deletesPerFile[file] = append(deletesPerFile[file], arr)
-		}
+			return nil
+		})
 	}
 
-	return deletesPerFile, err
+	// Wait for all DVs to load before processing Parquet deletes
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Phase 2: Load Parquet position deletes (skip if DV already exists for that data file)
+	g, ctx = errgroup.WithContext(ctx)
+	g.SetLimit(concurrency)
+
+	for _, df := range parquetDeleteFiles {
+		df := df
+		g.Go(func() error {
+			// readDeletes returns map[dataFilePath]*arrow.Chunked
+			fileDeletes, err := readDeletes(ctx, fs, df)
+			if err != nil {
+				return err
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			for dataFilePath, chunks := range fileDeletes {
+				// Skip if DV already exists for this data file
+				if _, hasDV := deletePerFiles[dataFilePath]; hasDV {
+					chunks.Release()
+					continue
+				}
+
+				// Convert chunks to position set
+				positions := make(map[int64]struct{})
+				for _, chunk := range chunks.Chunks() {
+					for _, pos := range chunk.(*array.Int64).Int64Values() {
+						positions[pos] = struct{}{}
+					}
+				}
+				chunks.Release()
+
+				// Merge if data file already has deletes from another Parquet file
+				if existing, ok := deletePerFiles[dataFilePath]; ok {
+					existingSet := existing.(*SetPositionDeleteIndex)
+					for pos := range positions {
+						existingSet.positions[pos] = struct{}{}
+					}
+				} else {
+					deletePerFiles[dataFilePath] = &SetPositionDeleteIndex{positions: positions}
+				}
+			}
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	return deletePerFiles, nil
 }
 
 func readDeletes(ctx context.Context, fs iceio.IO, dataFile iceberg.DataFile) (_ map[string]*arrow.Chunked, err error) {
@@ -152,12 +210,12 @@ func readDeletes(ctx context.Context, fs iceio.IO, dataFile iceberg.DataFile) (_
 
 type set[T comparable] map[T]struct{}
 
-func combinePositionalDeletes(mem memory.Allocator, deletes set[int64], start, end int64) arrow.Array {
+func combinePositionalDeletes(mem memory.Allocator, deletes PositionDeleteIndex, start, end int64) arrow.Array {
 	bldr := array.NewInt64Builder(mem)
 	defer bldr.Release()
 
 	for i := start; i < end; i++ {
-		if _, ok := deletes[i]; !ok {
+		if !deletes.Contains(i) {
 			bldr.Append(i)
 		}
 	}
@@ -167,7 +225,7 @@ func combinePositionalDeletes(mem memory.Allocator, deletes set[int64], start, e
 
 type recProcessFn func(arrow.RecordBatch) (arrow.RecordBatch, error)
 
-func processPositionalDeletes(ctx context.Context, deletes set[int64]) recProcessFn {
+func processPositionalDeletes(ctx context.Context, deletes PositionDeleteIndex) recProcessFn {
 	nextIdx, mem := int64(0), compute.GetAllocator(ctx)
 
 	return func(r arrow.RecordBatch) (arrow.RecordBatch, error) {
@@ -386,7 +444,7 @@ func (as *arrowScan) processRecords(
 	return err
 }
 
-func (as *arrowScan) recordsFromTask(ctx context.Context, task internal.Enumerated[FileScanTask], out chan<- enumeratedRecord, positionalDeletes positionDeletes) (err error) {
+func (as *arrowScan) recordsFromTask(ctx context.Context, task internal.Enumerated[FileScanTask], out chan<- enumeratedRecord, positionalDeletes PositionDeleteIndex) (err error) {
 	defer func() {
 		if err != nil {
 			out <- enumeratedRecord{Task: task, Err: err}
@@ -408,17 +466,8 @@ func (as *arrowScan) recordsFromTask(ctx context.Context, task internal.Enumerat
 	defer iceinternal.CheckedClose(rdr, &err)
 
 	pipeline := make([]recProcessFn, 0, 2)
-	if len(positionalDeletes) > 0 {
-		deletes := set[int64]{}
-		for _, chunk := range positionalDeletes {
-			for _, a := range chunk.Chunks() {
-				for _, v := range a.(*array.Int64).Int64Values() {
-					deletes[v] = struct{}{}
-				}
-			}
-		}
-
-		pipeline = append(pipeline, processPositionalDeletes(ctx, deletes))
+	if positionalDeletes != nil && !positionalDeletes.IsEmpty() {
+		pipeline = append(pipeline, processPositionalDeletes(ctx, positionalDeletes))
 	}
 
 	filterFunc, dropFile, err = as.getRecordFilter(ctx, iceSchema)
@@ -498,9 +547,8 @@ func createIterator(ctx context.Context, numWorkers uint, records <-chan enumera
 			}
 
 			for _, v := range deletesPerFile {
-				for _, chunk := range v {
-					chunk.Release()
-				}
+				v.Release()
+
 			}
 		}()
 

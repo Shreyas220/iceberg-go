@@ -169,9 +169,7 @@ func (r *Reader) ReadFooter() (*Footer, error) {
 
 // ReadBlob reads the content of a specific blob.
 func (r *Reader) ReadBlob(b BlobMetadata) ([]byte, error) {
-	if !r.footerRead {
-		return nil, fmt.Errorf("puffin: footer not read")
-	}
+
 	if b.Length < 0 {
 		return nil, fmt.Errorf("puffin: negative blob length")
 	}
@@ -185,10 +183,18 @@ func (r *Reader) ReadBlob(b BlobMetadata) ([]byte, error) {
 	if end < b.Offset || b.Offset < MagicSize {
 		return nil, fmt.Errorf("puffin: blob offset/length invalid offset=%d length=%d", b.Offset, b.Length)
 	}
-	startLimit := r.footerStart
-	if end > startLimit {
-		return nil, fmt.Errorf("puffin: blob out of bounds offset=%d length=%d end=%d footerStart=%d",
-			b.Offset, b.Length, end, startLimit)
+
+	if r.footerRead {
+		startLimit := r.footerStart
+		if end > startLimit {
+			return nil, fmt.Errorf("puffin: blob out of bounds offset=%d length=%d end=%d footerStart=%d",
+				b.Offset, b.Length, end, startLimit)
+		}
+	} else {
+		if end > r.size {
+			return nil, fmt.Errorf("puffin: blob extends past end of file offset=%d length=%d fileSize=%d",
+				b.Offset, b.Length, r.size)
+		}
 	}
 
 	data := make([]byte, b.Length)
@@ -197,6 +203,30 @@ func (r *Reader) ReadBlob(b BlobMetadata) ([]byte, error) {
 	}
 
 	return data, nil
+}
+
+// ReadRange reads a raw byte range with Puffin boundary checks.
+func (r *Reader) ReadRange(offset, length int64) ([]byte, error) {
+	if !r.footerRead {
+		return nil, fmt.Errorf("puffin: footer not read")
+	}
+	if length < 0 {
+		return nil, fmt.Errorf("puffin: negative length")
+	}
+	end := offset + length
+	if end < offset || offset < MagicSize {
+		return nil, fmt.Errorf("puffin: offset/length invalid offset=%d length=%d", offset, length)
+	}
+	if end > r.footerStart {
+		return nil, fmt.Errorf("puffin: range out of bounds offset=%d length=%d end=%d footerStart=%d",
+			offset, length, end, r.footerStart)
+	}
+
+	buf := make([]byte, length)
+	if _, err := r.r.ReadAt(buf, offset); err != nil {
+		return nil, fmt.Errorf("puffin: read range: %w", err)
+	}
+	return buf, nil
 }
 
 func validateBlobs(blobs []BlobMetadata, footerStart int64) error {
