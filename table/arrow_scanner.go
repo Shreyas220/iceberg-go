@@ -43,60 +43,109 @@ const (
 )
 
 type (
-	positionDeletes   = []*arrow.Chunked
-	perFilePosDeletes = map[string]positionDeletes
+	// perFilePosDeletes maps data file paths to their delete index.
+	// All values implement PositionDeleteIndex with a Load() method:
+	//   - ParquetPositionDeleteIndex: Load() is no-op (data already in Arrow chunks)
+	//   - RoaringPositionDeleteIndex: Load() reads DV from Puffin file (lazy)
+	// Always call Load() before using Contains() or IsEmpty().
+	perFilePosDeletes = map[string]PositionDeleteIndex
 )
 
 func readAllDeleteFiles(ctx context.Context, fs iceio.IO, tasks []FileScanTask, concurrency int) (perFilePosDeletes, error) {
-	var (
-		deletesPerFile = make(perFilePosDeletes)
-		uniqueDeletes  = make(map[string]iceberg.DataFile)
-		err            error
-	)
 
-	for _, t := range tasks {
-		for _, d := range t.DeleteFiles {
-			if d.ContentType() != iceberg.EntryContentPosDeletes {
+	// read all the delete files by format
+	// parpuet and puffin
+	parquetDeleteFiles := make(map[string]iceberg.DataFile)
+	puffinDV := make(map[string]iceberg.DataFile)
+
+	for _, task := range tasks {
+		for _, deleteFile := range task.DeleteFiles {
+			switch deleteFile.ContentType() {
+			case iceberg.EntryContentPosDeletes:
+				switch deleteFile.FileFormat() {
+				case iceberg.ParquetFile:
+					parquetDeleteFiles[deleteFile.FilePath()] = deleteFile
+				case iceberg.PuffinFile:
+					if ref := deleteFile.ReferencedDataFile(); ref != nil {
+						puffinDV[*ref] = deleteFile
+					}
+				}
+			case iceberg.EntryContentEqDeletes:
+				println("eq deletes not supported")
 				continue
-			}
-
-			if _, ok := uniqueDeletes[d.FilePath()]; !ok {
-				uniqueDeletes[d.FilePath()] = d
 			}
 		}
 	}
-
-	if len(uniqueDeletes) == 0 {
-		return deletesPerFile, nil
+	// return early if nothing to be deleted
+	if len(parquetDeleteFiles) == 0 && len(puffinDV) == 0 {
+		return make(perFilePosDeletes), nil
 	}
 
+	deletePerFiles := make(perFilePosDeletes)
+	var mu sync.Mutex
+
+	// Phase 1: Create lazy DV indexes (they take priority over Parquet pos deletes)
+	// DVs are NOT loaded here - Load() will be called by the worker when it
+	// processes the associated data file. This improves:
+	//   - Time-to-first-row (no waiting for all DVs to load)
+	//   - Memory usage (only load DVs for files actually processed)
+	//   - Efficiency for LIMIT queries (may never load most DVs)
+	for dataFilePath, df := range puffinDV {
+		deletePerFiles[dataFilePath] = NewLazyDVIndex(fs, df)
+	}
+
+	// No g.Wait() needed here - DVs are lazy, nothing to wait for!
+
+	// Phase 2: Load Parquet position deletes (skip if DV already exists for that data file)
+	// Note: Parquet position deletes are still loaded eagerly because we need to
+	// read the file to discover which data files they affect.
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(concurrency)
 
-	perFileChan := make(chan map[string]*arrow.Chunked, concurrency)
-	go func() {
-		defer close(perFileChan)
-		for _, v := range uniqueDeletes {
-			g.Go(func() error {
-				deletes, err := readDeletes(ctx, fs, v)
-				if deletes != nil {
-					perFileChan <- deletes
+	for _, df := range parquetDeleteFiles {
+		df := df
+		g.Go(func() error {
+			// readDeletes returns map[dataFilePath]*arrow.Chunked
+			fileDeletes, err := readDeletes(ctx, fs, df)
+			if err != nil {
+				return err
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			for dataFilePath, chunks := range fileDeletes {
+				// Skip if DV already exists for this data file
+				// DVs take priority over Parquet position deletes
+				if _, hasDV := deletePerFiles[dataFilePath]; hasDV {
+					chunks.Release()
+					continue
 				}
 
-				return err
-			})
-		}
-
-		err = g.Wait()
-	}()
-
-	for deletes := range perFileChan {
-		for file, arr := range deletes {
-			deletesPerFile[file] = append(deletesPerFile[file], arr)
-		}
+				// Accumulate Arrow chunks directly - no conversion to map!
+				// This is more memory efficient and avoids the overhead of
+				// maintaining a hash map. The Contains() method will search
+				// across all chunks using binary search.
+				if existing, ok := deletePerFiles[dataFilePath]; ok {
+					// Merge: append this chunk to existing chunks for this data file
+					existingIdx := existing.(*ParquetPositionDeleteIndex)
+					existingIdx.chunks = append(existingIdx.chunks, chunks)
+				} else {
+					// First delete file for this data file
+					deletePerFiles[dataFilePath] = &ParquetPositionDeleteIndex{
+						chunks: []*arrow.Chunked{chunks},
+					}
+				}
+			}
+			return nil
+		})
 	}
 
-	return deletesPerFile, err
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	return deletePerFiles, nil
 }
 
 func readDeletes(ctx context.Context, fs iceio.IO, dataFile iceberg.DataFile) (_ map[string]*arrow.Chunked, err error) {
@@ -152,12 +201,12 @@ func readDeletes(ctx context.Context, fs iceio.IO, dataFile iceberg.DataFile) (_
 
 type set[T comparable] map[T]struct{}
 
-func combinePositionalDeletes(mem memory.Allocator, deletes set[int64], start, end int64) arrow.Array {
+func combinePositionalDeletes(mem memory.Allocator, deletes PositionDeleteIndex, start, end int64) arrow.Array {
 	bldr := array.NewInt64Builder(mem)
 	defer bldr.Release()
 
 	for i := start; i < end; i++ {
-		if _, ok := deletes[i]; !ok {
+		if !deletes.Contains(i) {
 			bldr.Append(i)
 		}
 	}
@@ -167,7 +216,7 @@ func combinePositionalDeletes(mem memory.Allocator, deletes set[int64], start, e
 
 type recProcessFn func(arrow.RecordBatch) (arrow.RecordBatch, error)
 
-func processPositionalDeletes(ctx context.Context, deletes set[int64]) recProcessFn {
+func processPositionalDeletes(ctx context.Context, deletes PositionDeleteIndex) recProcessFn {
 	nextIdx, mem := int64(0), compute.GetAllocator(ctx)
 
 	return func(r arrow.RecordBatch) (arrow.RecordBatch, error) {
@@ -386,7 +435,7 @@ func (as *arrowScan) processRecords(
 	return err
 }
 
-func (as *arrowScan) recordsFromTask(ctx context.Context, task internal.Enumerated[FileScanTask], out chan<- enumeratedRecord, positionalDeletes positionDeletes) (err error) {
+func (as *arrowScan) recordsFromTask(ctx context.Context, task internal.Enumerated[FileScanTask], out chan<- enumeratedRecord, positionalDeletes PositionDeleteIndex) (err error) {
 	defer func() {
 		if err != nil {
 			out <- enumeratedRecord{Task: task, Err: err}
@@ -408,17 +457,8 @@ func (as *arrowScan) recordsFromTask(ctx context.Context, task internal.Enumerat
 	defer iceinternal.CheckedClose(rdr, &err)
 
 	pipeline := make([]recProcessFn, 0, 2)
-	if len(positionalDeletes) > 0 {
-		deletes := set[int64]{}
-		for _, chunk := range positionalDeletes {
-			for _, a := range chunk.Chunks() {
-				for _, v := range a.(*array.Int64).Int64Values() {
-					deletes[v] = struct{}{}
-				}
-			}
-		}
-
-		pipeline = append(pipeline, processPositionalDeletes(ctx, deletes))
+	if positionalDeletes != nil && !positionalDeletes.IsEmpty() {
+		pipeline = append(pipeline, processPositionalDeletes(ctx, positionalDeletes))
 	}
 
 	filterFunc, dropFile, err = as.getRecordFilter(ctx, iceSchema)
@@ -498,9 +538,8 @@ func createIterator(ctx context.Context, numWorkers uint, records <-chan enumera
 			}
 
 			for _, v := range deletesPerFile {
-				for _, chunk := range v {
-					chunk.Release()
-				}
+				v.Release()
+
 			}
 		}()
 
@@ -579,8 +618,20 @@ func (as *arrowScan) recordBatchesFromTasksAndDeletes(ctx context.Context, tasks
 						return
 					}
 
-					if err := as.recordsFromTask(ctx, task, records,
-						deletesPerFile[task.Value.File.FilePath()]); err != nil {
+					// Get delete index for this data file (may be nil if no deletes)
+					deleteIndex := deletesPerFile[task.Value.File.FilePath()]
+
+					// Load the index if it exists (triggers lazy loading for DVs)
+					// For ParquetPositionDeleteIndex: no-op (already loaded)
+					// For RoaringPositionDeleteIndex (DV): reads Puffin file now
+					if deleteIndex != nil {
+						if err := deleteIndex.Load(ctx); err != nil {
+							cancel(err)
+							return
+						}
+					}
+
+					if err := as.recordsFromTask(ctx, task, records, deleteIndex); err != nil {
 						cancel(err)
 
 						return
