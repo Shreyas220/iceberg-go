@@ -24,8 +24,12 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"sort"
+	"sync"
 
 	"github.com/RoaringBitmap/roaring"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/iceberg-go"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/puffin"
@@ -39,48 +43,122 @@ const (
 
 // PositionDeleteIndex is an interface for checking if a row position is deleted.
 type PositionDeleteIndex interface {
+	// Load ensures the index is loaded and ready to use.
+	// For eager implementations (e.g., ParquetPositionDeleteIndex), this is a no-op.
+	// For lazy implementations (e.g., LazyDVIndex), this triggers the actual I/O.
+	// Must be called before Contains() or IsEmpty().
+	// Safe to call multiple times; subsequent calls are no-ops.
+	Load(ctx context.Context) error
 	// Contains returns true if the position is marked as deleted.
+	// Load() must be called before this method.
 	Contains(pos int64) bool
 	// IsEmpty returns true if the index contains no deletes.
+	// Load() must be called before this method.
 	IsEmpty() bool
 	// Release releases any resources held by the index.
 	Release()
 }
 
-// ParquetPositionDeleteIndex implements PositionDeleteIndex using a hash map.
+// ParquetPositionDeleteIndex implements PositionDeleteIndex using Arrow chunks.
 // Used for position deletes loaded from Parquet delete files.
+// This is an "eager" implementation - data is already loaded at construction time.
 type ParquetPositionDeleteIndex struct {
-	positions map[int64]struct{}
+	chunks []*arrow.Chunked
+}
+
+// Load is a no-op for ParquetPositionDeleteIndex since data is already loaded.
+func (idx *ParquetPositionDeleteIndex) Load(ctx context.Context) error {
+	return nil
 }
 
 func (idx *ParquetPositionDeleteIndex) Contains(pos int64) bool {
-	_, ok := idx.positions[pos]
-	return ok
+	for _, chunk := range idx.chunks {
+		for _, arr := range chunk.Chunks() {
+			// Iceberg spec requires position deletes to be sorted by file_path and then pos.
+			// So we can use binary search.
+			if i64Arr, ok := arr.(*array.Int64); ok {
+				vals := i64Arr.Int64Values()
+				i := sort.Search(len(vals), func(i int) bool { return vals[i] >= pos })
+				if i < len(vals) && vals[i] == pos {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (idx *ParquetPositionDeleteIndex) IsEmpty() bool {
-	return len(idx.positions) == 0
+	for _, chunk := range idx.chunks {
+		if chunk.Len() > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (idx *ParquetPositionDeleteIndex) Release() {
-	// No-op: Go's GC handles map cleanup
+	for _, chunk := range idx.chunks {
+		chunk.Release()
+	}
+	idx.chunks = nil
 }
 
 // RoaringPositionDeleteIndex implements PositionDeleteIndex using Roaring Bitmaps.
 // It handles 64-bit positions by splitting them into a high 32-bit key and a low 32-bit bitmap.
+// Supports lazy loading: if fs and dvFile are set, Load() will read the DV from file.
 type RoaringPositionDeleteIndex struct {
 	// highBits maps the high 32 bits of the position to a Roaring Bitmap of the low 32 bits.
 	highBits map[uint32]*roaring.Bitmap
+
+	// For lazy loading of DVs
+	fs     iceio.IO
+	dvFile iceberg.DataFile
+	once   sync.Once
+	err    error
 }
 
+// NewRoaringPositionDeleteIndex creates an empty index (used during deserialization).
 func NewRoaringPositionDeleteIndex() *RoaringPositionDeleteIndex {
 	return &RoaringPositionDeleteIndex{
 		highBits: make(map[uint32]*roaring.Bitmap),
 	}
 }
 
+// NewLazyDVIndex creates a lazy-loading DV index.
+// The actual DV file is NOT read until Load() is called.
+func NewLazyDVIndex(fs iceio.IO, dvFile iceberg.DataFile) *RoaringPositionDeleteIndex {
+	return &RoaringPositionDeleteIndex{
+		fs:     fs,
+		dvFile: dvFile,
+		// highBits is nil until Load() is called
+	}
+}
+
+// Load ensures the index is loaded. For lazy DVs, this reads the Puffin file.
+// Safe to call concurrently; the actual I/O will only happen once.
+func (idx *RoaringPositionDeleteIndex) Load(ctx context.Context) error {
+	// If highBits is already populated, nothing to do (eager case or already loaded)
+	if idx.highBits != nil {
+		return nil
+	}
+
+	// Lazy loading case: read the DV file
+	idx.once.Do(func() {
+		loaded, err := LoadDVIndex(ctx, idx.fs, idx.dvFile)
+		if err != nil {
+			idx.err = err
+			return
+		}
+		// LoadDVIndex returns *RoaringPositionDeleteIndex
+		idx.highBits = loaded.(*RoaringPositionDeleteIndex).highBits
+	})
+	return idx.err
+}
+
 func (idx *RoaringPositionDeleteIndex) Contains(pos int64) bool {
-	if pos < 0 {
+	// nil check for lazy loading case (Load() not called yet)
+	if idx.highBits == nil || pos < 0 {
 		return false
 	}
 	high := uint32(pos >> 32)
@@ -97,7 +175,8 @@ func (idx *RoaringPositionDeleteIndex) Release() {
 }
 
 func (idx *RoaringPositionDeleteIndex) IsEmpty() bool {
-	return len(idx.highBits) == 0
+	// nil means not loaded yet, treat as empty
+	return idx.highBits == nil || len(idx.highBits) == 0
 }
 
 // DeserializeDVPayload deserializes a Deletion Vector payload from a byte slice.

@@ -43,6 +43,11 @@ const (
 )
 
 type (
+	// perFilePosDeletes maps data file paths to their delete index.
+	// All values implement PositionDeleteIndex with a Load() method:
+	//   - ParquetPositionDeleteIndex: Load() is no-op (data already in Arrow chunks)
+	//   - RoaringPositionDeleteIndex: Load() reads DV from Puffin file (lazy)
+	// Always call Load() before using Contains() or IsEmpty().
 	perFilePosDeletes = map[string]PositionDeleteIndex
 )
 
@@ -77,35 +82,24 @@ func readAllDeleteFiles(ctx context.Context, fs iceio.IO, tasks []FileScanTask, 
 	}
 
 	deletePerFiles := make(perFilePosDeletes)
-	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(concurrency)
 	var mu sync.Mutex
 
-	// Phase 1: Load Puffin DVs first (they take priority over Parquet pos deletes)
+	// Phase 1: Create lazy DV indexes (they take priority over Parquet pos deletes)
+	// DVs are NOT loaded here - Load() will be called by the worker when it
+	// processes the associated data file. This improves:
+	//   - Time-to-first-row (no waiting for all DVs to load)
+	//   - Memory usage (only load DVs for files actually processed)
+	//   - Efficiency for LIMIT queries (may never load most DVs)
 	for dataFilePath, df := range puffinDV {
-		df := df
-		dataFilePath := dataFilePath
-		g.Go(func() error {
-			idx, err := LoadDVIndex(ctx, fs, df)
-			if err != nil {
-				return err
-			}
-
-			mu.Lock()
-			deletePerFiles[dataFilePath] = idx
-			mu.Unlock()
-
-			return nil
-		})
+		deletePerFiles[dataFilePath] = NewLazyDVIndex(fs, df)
 	}
 
-	// Wait for all DVs to load before processing Parquet deletes
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
+	// No g.Wait() needed here - DVs are lazy, nothing to wait for!
 
 	// Phase 2: Load Parquet position deletes (skip if DV already exists for that data file)
-	g, ctx = errgroup.WithContext(ctx)
+	// Note: Parquet position deletes are still loaded eagerly because we need to
+	// read the file to discover which data files they affect.
+	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(concurrency)
 
 	for _, df := range parquetDeleteFiles {
@@ -122,28 +116,25 @@ func readAllDeleteFiles(ctx context.Context, fs iceio.IO, tasks []FileScanTask, 
 
 			for dataFilePath, chunks := range fileDeletes {
 				// Skip if DV already exists for this data file
+				// DVs take priority over Parquet position deletes
 				if _, hasDV := deletePerFiles[dataFilePath]; hasDV {
 					chunks.Release()
 					continue
 				}
 
-				// Convert chunks to position set
-				positions := make(map[int64]struct{})
-				for _, chunk := range chunks.Chunks() {
-					for _, pos := range chunk.(*array.Int64).Int64Values() {
-						positions[pos] = struct{}{}
-					}
-				}
-				chunks.Release()
-
-				// Merge if data file already has deletes from another Parquet file
+				// Accumulate Arrow chunks directly - no conversion to map!
+				// This is more memory efficient and avoids the overhead of
+				// maintaining a hash map. The Contains() method will search
+				// across all chunks using binary search.
 				if existing, ok := deletePerFiles[dataFilePath]; ok {
+					// Merge: append this chunk to existing chunks for this data file
 					existingIdx := existing.(*ParquetPositionDeleteIndex)
-					for pos := range positions {
-						existingIdx.positions[pos] = struct{}{}
-					}
+					existingIdx.chunks = append(existingIdx.chunks, chunks)
 				} else {
-					deletePerFiles[dataFilePath] = &ParquetPositionDeleteIndex{positions: positions}
+					// First delete file for this data file
+					deletePerFiles[dataFilePath] = &ParquetPositionDeleteIndex{
+						chunks: []*arrow.Chunked{chunks},
+					}
 				}
 			}
 			return nil
@@ -627,8 +618,20 @@ func (as *arrowScan) recordBatchesFromTasksAndDeletes(ctx context.Context, tasks
 						return
 					}
 
-					if err := as.recordsFromTask(ctx, task, records,
-						deletesPerFile[task.Value.File.FilePath()]); err != nil {
+					// Get delete index for this data file (may be nil if no deletes)
+					deleteIndex := deletesPerFile[task.Value.File.FilePath()]
+
+					// Load the index if it exists (triggers lazy loading for DVs)
+					// For ParquetPositionDeleteIndex: no-op (already loaded)
+					// For RoaringPositionDeleteIndex (DV): reads Puffin file now
+					if deleteIndex != nil {
+						if err := deleteIndex.Load(ctx); err != nil {
+							cancel(err)
+							return
+						}
+					}
+
+					if err := as.recordsFromTask(ctx, task, records, deleteIndex); err != nil {
 						cancel(err)
 
 						return
