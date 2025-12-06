@@ -34,6 +34,21 @@ const (
 	FooterFlagCompressed = 1 // bit 0
 )
 
+// Standard puffin property keys.
+const (
+	// CreatedBy is a human-readable identification of the application writing the file, along with its version.
+	// Example: "Trino version 381".
+	CreatedBy = "created-by"
+)
+
+const (
+	// ApacheDataSketchesThetaV1 is a serialized compact Theta sketch from Apache DataSketches.
+	ApacheDataSketchesThetaV1 = "apache-datasketches-theta-v1"
+
+	// DeletionVectorV1 is a serialized deletion vector according to the Iceberg spec.
+	DeletionVectorV1 = "deletion-vector-v1"
+)
+
 // BlobMetadata describes a blob stored inside a Puffin file.
 type BlobMetadata struct {
 	Type             string            `json:"type"`

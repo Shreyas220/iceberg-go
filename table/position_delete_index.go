@@ -290,7 +290,7 @@ func LoadDVIndex(ctx context.Context, fs iceio.IO, dvFile iceberg.DataFile) (Pos
 			return nil, fmt.Errorf("failed to stat DV file: %w", err)
 		}
 
-		pr, err := puffin.NewReader(f, stat.Size())
+		pr, err := puffin.NewPuffinReader(f, stat.Size())
 		if err != nil {
 			return nil, fmt.Errorf("failed to create puffin reader: %w", err)
 		}

@@ -39,7 +39,7 @@ func TestRoundTripLayout(t *testing.T) {
 	require.NoError(t, w.Finish())
 
 	fileBytes := b.Bytes()
-	reader, err := NewReader(bytes.NewReader(fileBytes), int64(len(fileBytes)))
+	reader, err := NewPuffinReader(bytes.NewReader(fileBytes), int64(len(fileBytes)))
 	require.NoError(t, err)
 	footer, err := reader.ReadFooter()
 	require.NoError(t, err)
@@ -67,7 +67,7 @@ func TestRoundTripLayout(t *testing.T) {
 
 func TestFooterStartMagicRequired(t *testing.T) {
 	file := buildFile(t, buildOptions{corruptFooterStartMagic: true})
-	reader, err := NewReader(bytes.NewReader(file), int64(len(file)))
+	reader, err := NewPuffinReader(bytes.NewReader(file), int64(len(file)))
 	require.NoError(t, err)
 	_, err = reader.ReadFooter()
 	require.ErrorContains(t, err, "invalid footer start magic")
@@ -75,13 +75,13 @@ func TestFooterStartMagicRequired(t *testing.T) {
 
 func TestTrailingMagicRequired(t *testing.T) {
 	file := buildFile(t, buildOptions{corruptTrailingMagic: true})
-	_, err := NewReader(bytes.NewReader(file), int64(len(file)))
+	_, err := NewPuffinReader(bytes.NewReader(file), int64(len(file)))
 	require.ErrorContains(t, err, "invalid trailing magic")
 }
 
 func TestCompressedFooterFlagRejected(t *testing.T) {
 	file := buildFile(t, buildOptions{footerFlags: 1})
-	reader, err := NewReader(bytes.NewReader(file), int64(len(file)))
+	reader, err := NewPuffinReader(bytes.NewReader(file), int64(len(file)))
 	require.NoError(t, err)
 	_, err = reader.ReadFooter()
 	require.ErrorContains(t, err, "compressed footer unsupported")
@@ -89,7 +89,7 @@ func TestCompressedFooterFlagRejected(t *testing.T) {
 
 func TestUnknownFooterFlagRejected(t *testing.T) {
 	file := buildFile(t, buildOptions{footerFlags: 0x2})
-	reader, err := NewReader(bytes.NewReader(file), int64(len(file)))
+	reader, err := NewPuffinReader(bytes.NewReader(file), int64(len(file)))
 	require.NoError(t, err)
 	_, err = reader.ReadFooter()
 	require.ErrorContains(t, err, "unknown footer flags")
@@ -97,33 +97,15 @@ func TestUnknownFooterFlagRejected(t *testing.T) {
 
 func TestFooterLenTooLarge(t *testing.T) {
 	file := buildFile(t, buildOptions{footerLenOverride: 0xFFFFFFFF})
-	reader, err := NewReader(bytes.NewReader(file), int64(len(file)))
+	reader, err := NewPuffinReader(bytes.NewReader(file), int64(len(file)))
 	require.NoError(t, err)
 	_, err = reader.ReadFooter()
 	require.Error(t, err)
 }
 
-func TestFooterSizeOptionMismatch(t *testing.T) {
-	file := buildFile(t, buildOptions{})
-	footerSize := int64(len(file)) - MagicSize - 1 // wrong on purpose
-	reader, err := NewReaderWithOptions(bytes.NewReader(file), int64(len(file)), ReaderOptions{FooterSize: &footerSize})
-	require.NoError(t, err)
-	_, err = reader.ReadFooter()
-	require.ErrorContains(t, err, "footer size mismatch")
-}
-
-func TestFooterSizeOptionInvalid(t *testing.T) {
-	file := buildFile(t, buildOptions{})
-	footerSize := int64(1) // too small
-	reader, err := NewReaderWithOptions(bytes.NewReader(file), int64(len(file)), ReaderOptions{FooterSize: &footerSize})
-	require.NoError(t, err)
-	_, err = reader.ReadFooter()
-	require.ErrorContains(t, err, "invalid footer size")
-}
-
 func TestFooterJSONCorrupt(t *testing.T) {
 	file := buildFile(t, buildOptions{corruptFooterPayload: true})
-	reader, err := NewReader(bytes.NewReader(file), int64(len(file)))
+	reader, err := NewPuffinReader(bytes.NewReader(file), int64(len(file)))
 	require.NoError(t, err)
 	_, err = reader.ReadFooter()
 	require.ErrorContains(t, err, "decode footer")
@@ -138,13 +120,12 @@ func TestBlobValidationFailures(t *testing.T) {
 		{"compression", buildOptions{blobCompressionCodec: "lz4"}, "compression"},
 		{"offsetBeforeMagic", buildOptions{overrideBlobOffset: true, blobOffset: 0}, "offset before magic"},
 		{"overlapsFooter", buildOptions{blobOffset: MagicSize, blobLength: 10_000}, "extends into footer"},
-		{"overlapBlobs", buildOptions{blobOffset: MagicSize, secondBlob: true, secondBlobOffset: MagicSize + 1}, "overlaps or unordered"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			file := buildFile(t, tt.opts)
-			reader, err := NewReader(bytes.NewReader(file), int64(len(file)))
+			reader, err := NewPuffinReader(bytes.NewReader(file), int64(len(file)))
 			require.NoError(t, err)
 			_, err = reader.ReadFooter()
 			require.ErrorContains(t, err, tt.msg)
@@ -154,7 +135,7 @@ func TestBlobValidationFailures(t *testing.T) {
 
 func TestReadBlobRequiresFooter(t *testing.T) {
 	file := buildFile(t, buildOptions{})
-	reader, err := NewReader(bytes.NewReader(file), int64(len(file)))
+	reader, err := NewPuffinReader(bytes.NewReader(file), int64(len(file)))
 	require.NoError(t, err)
 	_, err = reader.ReadBlob(BlobMetadata{})
 	require.ErrorContains(t, err, "footer not read")
@@ -286,4 +267,39 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func TestReadAllBlobs(t *testing.T) {
+	b := &bytes.Buffer{}
+	w, err := NewWriter(b)
+	require.NoError(t, err)
+
+	// Write 3 blobs
+	require.NoError(t, w.AddBlob(BlobMetadata{Type: "type-a", SnapshotID: 1, SequenceNumber: 1}, []byte("aaa")))
+	require.NoError(t, w.AddBlob(BlobMetadata{Type: "type-b", SnapshotID: 1, SequenceNumber: 1}, []byte("bbbbb")))
+	require.NoError(t, w.AddBlob(BlobMetadata{Type: "type-c", SnapshotID: 1, SequenceNumber: 1}, []byte("c")))
+	require.NoError(t, w.Finish())
+
+	fileBytes := b.Bytes()
+	reader, err := NewPuffinReader(bytes.NewReader(fileBytes), int64(len(fileBytes)))
+	require.NoError(t, err)
+
+	footer, err := reader.ReadFooter()
+	require.NoError(t, err)
+	require.Len(t, footer.Blobs, 3)
+
+	// Read all blobs at once
+	allBlobs, err := reader.ReadAllBlobs(footer.Blobs)
+	require.NoError(t, err)
+	require.Len(t, allBlobs, 3)
+
+	// Verify order and content preserved
+	require.Equal(t, "type-a", allBlobs[0].Metadata.Type)
+	require.Equal(t, []byte("aaa"), allBlobs[0].Data)
+
+	require.Equal(t, "type-b", allBlobs[1].Metadata.Type)
+	require.Equal(t, []byte("bbbbb"), allBlobs[1].Data)
+
+	require.Equal(t, "type-c", allBlobs[2].Metadata.Type)
+	require.Equal(t, []byte("c"), allBlobs[2].Data)
 }

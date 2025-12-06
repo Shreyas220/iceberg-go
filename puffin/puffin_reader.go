@@ -25,29 +25,20 @@ import (
 	"math"
 )
 
-// Reader provides access to a Puffin file's blobs and metadata.
+// PuffinReader provides access to a Puffin file's blobs and metadata.
 // It uses io.ReaderAt to allow efficient random access to blobs.
-type Reader struct {
-	r               io.ReaderAt
-	size            int64
-	footerStart     int64
-	footerRead      bool
-	knownFooterSize *int64
+type PuffinReader struct {
+	r           io.ReaderAt
+	size        int64
+	footerStart int64
+	footerRead  bool
 }
 
-// NewReader creates a new Puffin reader.
-func NewReader(r io.ReaderAt, size int64) (*Reader, error) {
-	return NewReaderWithOptions(r, size, ReaderOptions{})
-}
-
-// ReaderOptions customize reader behavior.
-type ReaderOptions struct {
-	// FooterSize, if provided, is the total footer size in bytes (footer start magic + payload + trailer).
-	FooterSize *int64
-}
-
-// NewReaderWithOptions creates a new Puffin reader with optional settings.
-func NewReaderWithOptions(r io.ReaderAt, size int64, opts ReaderOptions) (*Reader, error) {
+// NewPuffinReader creates a new Puffin reader.
+func NewPuffinReader(r io.ReaderAt, size int64) (*PuffinReader, error) {
+	if r == nil {
+		return nil, fmt.Errorf("puffin: reader is nil")
+	}
 	if size < MagicSize+footerTrailerSize {
 		return nil, fmt.Errorf("puffin: file too small (%d bytes)", size)
 	}
@@ -70,23 +61,11 @@ func NewReaderWithOptions(r io.ReaderAt, size int64, opts ReaderOptions) (*Reade
 		return nil, fmt.Errorf("puffin: invalid trailing magic")
 	}
 
-	var knownFooterSize *int64
-	if opts.FooterSize != nil {
-		value := *opts.FooterSize
-		if value <= 0 {
-			return nil, fmt.Errorf("puffin: invalid footer size %d", value)
-		}
-		if value > size-MagicSize {
-			return nil, fmt.Errorf("puffin: footer size %d exceeds file size %d", value, size)
-		}
-		knownFooterSize = &value
-	}
-
-	return &Reader{r: r, size: size, knownFooterSize: knownFooterSize}, nil
+	return &PuffinReader{r: r, size: size}, nil
 }
 
 // ReadFooter reads and parses the file footer.
-func (r *Reader) ReadFooter() (*Footer, error) {
+func (r *PuffinReader) ReadFooter() (*Footer, error) {
 	offset := r.size - footerTrailerSize
 	var trailer [8]byte // Length + Flags
 
@@ -96,19 +75,7 @@ func (r *Reader) ReadFooter() (*Footer, error) {
 	trailerFooterLen := int64(binary.LittleEndian.Uint32(trailer[0:4]))
 	flags := binary.LittleEndian.Uint32(trailer[4:8])
 
-	var footerLen int64
-	if r.knownFooterSize != nil {
-		footerSize := *r.knownFooterSize
-		if footerSize < MagicSize+footerTrailerSize {
-			return nil, fmt.Errorf("puffin: invalid footer size %d", footerSize)
-		}
-		footerLen = footerSize - MagicSize - footerTrailerSize
-		if trailerFooterLen != footerLen {
-			return nil, fmt.Errorf("puffin: footer size mismatch trailerLen=%d expected=%d", trailerFooterLen, footerLen)
-		}
-	} else {
-		footerLen = trailerFooterLen
-	}
+	footerLen := trailerFooterLen
 
 	if flags&FooterFlagCompressed != 0 {
 		return nil, fmt.Errorf("puffin: compressed footer unsupported")
@@ -119,6 +86,9 @@ func (r *Reader) ReadFooter() (*Footer, error) {
 
 	if footerLen < 0 {
 		return nil, fmt.Errorf("puffin: invalid footer length %d", footerLen)
+	}
+	if footerLen > math.MaxInt32 {
+		return nil, fmt.Errorf("puffin: footer length %d exceeds 2GB limit", footerLen)
 	}
 	if footerLen > math.MaxInt64-int64(MagicSize)-footerTrailerSize {
 		return nil, fmt.Errorf("puffin: footer length %d overflows", footerLen)
@@ -168,7 +138,10 @@ func (r *Reader) ReadFooter() (*Footer, error) {
 }
 
 // ReadBlob reads the content of a specific blob.
-func (r *Reader) ReadBlob(b BlobMetadata) ([]byte, error) {
+func (r *PuffinReader) ReadBlob(b BlobMetadata) ([]byte, error) {
+	if !r.footerRead {
+		return nil, fmt.Errorf("puffin: footer not read")
+	}
 
 	if b.Length < 0 {
 		return nil, fmt.Errorf("puffin: negative blob length")
@@ -206,7 +179,7 @@ func (r *Reader) ReadBlob(b BlobMetadata) ([]byte, error) {
 }
 
 // ReadRange reads a raw byte range with Puffin boundary checks.
-func (r *Reader) ReadRange(offset, length int64) ([]byte, error) {
+func (r *PuffinReader) ReadRange(offset, length int64) ([]byte, error) {
 	if !r.footerRead {
 		return nil, fmt.Errorf("puffin: footer not read")
 	}
@@ -229,8 +202,55 @@ func (r *Reader) ReadRange(offset, length int64) ([]byte, error) {
 	return buf, nil
 }
 
+// BlobData pairs a blob's metadata with its content.
+type BlobData struct {
+	Metadata BlobMetadata
+	Data     []byte
+}
+
+// ReadAllBlobs reads multiple blobs, sorted by offset for sequential I/O efficiency.
+// Returns results in the same order as the input blobs.
+func (r *PuffinReader) ReadAllBlobs(blobs []BlobMetadata) ([]BlobData, error) {
+	if !r.footerRead {
+		return nil, fmt.Errorf("puffin: footer not read")
+	}
+	if len(blobs) == 0 {
+		return nil, nil
+	}
+
+	// Create index mapping for original order
+	type indexedBlob struct {
+		index int
+		blob  BlobMetadata
+	}
+	indexed := make([]indexedBlob, len(blobs))
+	for i, b := range blobs {
+		indexed[i] = indexedBlob{index: i, blob: b}
+	}
+
+	// Sort by offset for sequential I/O
+	for i := 0; i < len(indexed)-1; i++ {
+		for j := i + 1; j < len(indexed); j++ {
+			if indexed[j].blob.Offset < indexed[i].blob.Offset {
+				indexed[i], indexed[j] = indexed[j], indexed[i]
+			}
+		}
+	}
+
+	// Read in offset order
+	results := make([]BlobData, len(blobs))
+	for _, ib := range indexed {
+		data, err := r.ReadBlob(ib.blob)
+		if err != nil {
+			return nil, fmt.Errorf("puffin: read blob %d: %w", ib.index, err)
+		}
+		results[ib.index] = BlobData{Metadata: ib.blob, Data: data}
+	}
+
+	return results, nil
+}
+
 func validateBlobs(blobs []BlobMetadata, footerStart int64) error {
-	prevEnd := int64(MagicSize)
 	for i, b := range blobs {
 		if b.Type == "" {
 			return fmt.Errorf("blob %d: type required", i)
@@ -252,10 +272,6 @@ func validateBlobs(blobs []BlobMetadata, footerStart int64) error {
 		if end > footerStart {
 			return fmt.Errorf("blob %d: extends into footer offset=%d length=%d footerStart=%d", i, b.Offset, b.Length, footerStart)
 		}
-		if b.Offset < prevEnd {
-			return fmt.Errorf("blob %d: overlaps or unordered offset=%d previousEnd=%d", i, b.Offset, prevEnd)
-		}
-		prevEnd = end
 	}
 	return nil
 }

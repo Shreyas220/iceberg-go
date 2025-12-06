@@ -25,8 +25,8 @@ import (
 	"math"
 )
 
-// Writer writes a Puffin file to an output stream.
-type Writer struct {
+// PuffinWriter writes a Puffin file to an output stream.
+type PuffinWriter struct {
 	w         io.Writer
 	offset    int64
 	blobs     []BlobMetadata
@@ -36,7 +36,7 @@ type Writer struct {
 }
 
 // NewWriter creates a new Puffin writer.
-func NewWriter(w io.Writer) (*Writer, error) {
+func NewWriter(w io.Writer) (*PuffinWriter, error) {
 	if w == nil {
 		return nil, fmt.Errorf("puffin: writer is nil")
 	}
@@ -44,7 +44,7 @@ func NewWriter(w io.Writer) (*Writer, error) {
 	if _, err := w.Write(Magic[:]); err != nil {
 		return nil, fmt.Errorf("puffin: write leading magic: %w", err)
 	}
-	return &Writer{
+	return &PuffinWriter{
 		w:      w,
 		offset: MagicSize,
 		props:  make(map[string]string),
@@ -52,7 +52,7 @@ func NewWriter(w io.Writer) (*Writer, error) {
 }
 
 // SetProperties sets the file-level properties.
-func (w *Writer) SetProperties(props map[string]string) error {
+func (w *PuffinWriter) SetProperties(props map[string]string) error {
 	if w.done {
 		return fmt.Errorf("puffin: writer finalized")
 	}
@@ -66,7 +66,7 @@ func (w *Writer) SetProperties(props map[string]string) error {
 }
 
 // SetCreatedBy records the writer identifier/version in the footer properties.
-func (w *Writer) SetCreatedBy(createdBy string) error {
+func (w *PuffinWriter) SetCreatedBy(createdBy string) error {
 	if w.done {
 		return fmt.Errorf("puffin: writer finalized")
 	}
@@ -78,7 +78,7 @@ func (w *Writer) SetCreatedBy(createdBy string) error {
 }
 
 // AddBlob writes a blob to the file and records its metadata.
-func (w *Writer) AddBlob(meta BlobMetadata, data []byte) error {
+func (w *PuffinWriter) AddBlob(meta BlobMetadata, data []byte) error {
 	if w.done {
 		return fmt.Errorf("puffin: writer finalized")
 	}
@@ -105,7 +105,7 @@ func (w *Writer) AddBlob(meta BlobMetadata, data []byte) error {
 }
 
 // Finish writes the footer and closes the file structure (does not close the underlying writer).
-func (w *Writer) Finish() error {
+func (w *PuffinWriter) Finish() error {
 	if w.done {
 		return fmt.Errorf("puffin: writer finalized")
 	}
@@ -124,8 +124,8 @@ func (w *Writer) Finish() error {
 	if err != nil {
 		return fmt.Errorf("puffin: marshal footer: %w", err)
 	}
-	if len(payload) > math.MaxUint32 {
-		return fmt.Errorf("puffin: footer too large: %d bytes", len(payload))
+	if len(payload) > math.MaxInt32 {
+		return fmt.Errorf("puffin: footer too large: %d bytes exceeds 2GB limit", len(payload))
 	}
 
 	// Write Footer Start Magic
