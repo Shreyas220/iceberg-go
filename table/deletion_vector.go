@@ -25,6 +25,7 @@ import (
 
 	"github.com/apache/iceberg-go"
 	iceio "github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/puffin"
 )
 
 const (
@@ -93,14 +94,11 @@ func DeserializeDV(data []byte, expectedCardinality int64) (*RoaringPositionBitm
 }
 
 // ReadDV reads a deletion vector from a puffin file using the manifest entry metadata.
-// ContentOffset and ContentSizeInBytes must be set on the DataFile (required by v3 spec).
+// It uses the puffin reader's ReadAt for validated reads at ContentOffset/ContentSizeInBytes,
+// or falls back to scanning the puffin footer if offset metadata is not available.
 func ReadDV(fs iceio.IO, dvFile iceberg.DataFile) (*RoaringPositionBitmap, error) {
 	if dvFile.FileFormat() != iceberg.PuffinFile {
 		return nil, fmt.Errorf("expected PUFFIN format for deletion vector, got %s", dvFile.FileFormat())
-	}
-
-	if dvFile.ContentOffset() == nil || dvFile.ContentSizeInBytes() == nil {
-		return nil, fmt.Errorf("DV file %s missing required ContentOffset/ContentSizeInBytes", dvFile.FilePath())
 	}
 
 	f, err := fs.Open(dvFile.FilePath())
@@ -109,13 +107,39 @@ func ReadDV(fs iceio.IO, dvFile iceberg.DataFile) (*RoaringPositionBitmap, error
 	}
 	defer f.Close()
 
-	// Read blob directly at known offset. The Iceberg spec requires DV blobs
-	// to be uncompressed, so no decompression is needed.
-	offset := *dvFile.ContentOffset()
-	size := *dvFile.ContentSizeInBytes()
-	blobData := make([]byte, size)
-	if _, err := f.ReadAt(blobData, offset); err != nil {
-		return nil, fmt.Errorf("read DV blob at offset %d: %w", offset, err)
+	reader, err := puffin.NewReader(f)
+	if err != nil {
+		return nil, fmt.Errorf("create puffin reader for %s: %w", dvFile.FilePath(), err)
+	}
+
+	var blobData []byte
+
+	if dvFile.ContentOffset() != nil && dvFile.ContentSizeInBytes() != nil {
+		// Fast path: read blob directly at known offset using puffin.Reader.ReadAt
+		// which validates the range is within the blob data region.
+		offset := *dvFile.ContentOffset()
+		size := *dvFile.ContentSizeInBytes()
+		blobData = make([]byte, size)
+		if _, err := reader.ReadAt(blobData, offset); err != nil {
+			return nil, fmt.Errorf("read DV blob at offset %d: %w", offset, err)
+		}
+	} else {
+		// Fallback: scan puffin footer to find the first DV blob
+		var found bool
+		for i, blob := range reader.Blobs() {
+			if blob.Type == puffin.BlobTypeDeletionVector {
+				blobObj, err := reader.ReadBlob(i)
+				if err != nil {
+					return nil, fmt.Errorf("read DV blob: %w", err)
+				}
+				blobData = blobObj.Data
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("no deletion-vector-v1 blob found in %s", dvFile.FilePath())
+		}
 	}
 
 	return DeserializeDV(blobData, dvFile.Count())
