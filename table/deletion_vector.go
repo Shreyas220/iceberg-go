@@ -25,7 +25,6 @@ import (
 
 	"github.com/apache/iceberg-go"
 	iceio "github.com/apache/iceberg-go/io"
-	"github.com/apache/iceberg-go/puffin"
 )
 
 const (
@@ -94,11 +93,14 @@ func DeserializeDV(data []byte, expectedCardinality int64) (*RoaringPositionBitm
 }
 
 // ReadDV reads a deletion vector from a puffin file using the manifest entry metadata.
-// It uses ContentOffset/ContentSizeInBytes for a direct read when available,
-// otherwise falls back to parsing the puffin footer.
+// ContentOffset and ContentSizeInBytes must be set on the DataFile (required by v3 spec).
 func ReadDV(fs iceio.IO, dvFile iceberg.DataFile) (*RoaringPositionBitmap, error) {
 	if dvFile.FileFormat() != iceberg.PuffinFile {
 		return nil, fmt.Errorf("expected PUFFIN format for deletion vector, got %s", dvFile.FileFormat())
+	}
+
+	if dvFile.ContentOffset() == nil || dvFile.ContentSizeInBytes() == nil {
+		return nil, fmt.Errorf("DV file %s missing required ContentOffset/ContentSizeInBytes", dvFile.FilePath())
 	}
 
 	f, err := fs.Open(dvFile.FilePath())
@@ -107,40 +109,13 @@ func ReadDV(fs iceio.IO, dvFile iceberg.DataFile) (*RoaringPositionBitmap, error
 	}
 	defer f.Close()
 
-	var blobData []byte
-
-	if dvFile.ContentOffset() != nil && dvFile.ContentSizeInBytes() != nil {
-		// Fast path: read blob directly at known offset (skip puffin footer parsing).
-		// Note: this assumes uncompressed blobs. The Iceberg spec requires DV blobs
-		// to be uncompressed, and the puffin reader does not support compression either.
-		offset := *dvFile.ContentOffset()
-		size := *dvFile.ContentSizeInBytes()
-		blobData = make([]byte, size)
-		if _, err := f.ReadAt(blobData, offset); err != nil {
-			return nil, fmt.Errorf("read DV blob at offset %d: %w", offset, err)
-		}
-	} else {
-		// Fallback: parse puffin footer to find the DV blob
-		reader, err := puffin.NewReader(f)
-		if err != nil {
-			return nil, fmt.Errorf("create puffin reader: %w", err)
-		}
-
-		var found bool
-		for i, blob := range reader.Blobs() {
-			if blob.Type == puffin.BlobTypeDeletionVector {
-				blobObj, err := reader.ReadBlob(i)
-				if err != nil {
-					return nil, fmt.Errorf("read DV blob: %w", err)
-				}
-				blobData = blobObj.Data
-				found = true
-				break
-			}
-		}
-		if !found {
-			return nil, fmt.Errorf("no deletion-vector-v1 blob found in %s", dvFile.FilePath())
-		}
+	// Read blob directly at known offset. The Iceberg spec requires DV blobs
+	// to be uncompressed, so no decompression is needed.
+	offset := *dvFile.ContentOffset()
+	size := *dvFile.ContentSizeInBytes()
+	blobData := make([]byte, size)
+	if _, err := f.ReadAt(blobData, offset); err != nil {
+		return nil, fmt.Errorf("read DV blob at offset %d: %w", offset, err)
 	}
 
 	return DeserializeDV(blobData, dvFile.Count())
