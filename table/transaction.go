@@ -1499,6 +1499,10 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 }
 
 func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs io.IO, files []iceberg.DataFile, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) (seq2 iter.Seq2[arrow.RecordBatch, error], err error) {
+	// TODO: tasks are built without DeleteFiles/DeletionVectorFiles, so existing
+	// deletes (including DVs) are not excluded from the output position delete records.
+	// This produces redundant but correct (idempotent) delete records. A follow-up
+	// should populate DeletionVectorFiles from scan planning to avoid redundant deletes.
 	tasks := make([]FileScanTask, 0, len(files))
 	for _, f := range files {
 		tasks = append(tasks, FileScanTask{
@@ -1528,7 +1532,7 @@ func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs
 		concurrency:     concurrency,
 	}
 
-	deletesPerFile, err := readAllDeleteFiles(ctx, fs, tasks, concurrency)
+	deletesPerFile, _, err := readAllDeleteFiles(ctx, fs, tasks, concurrency)
 	if err != nil {
 		return nil, err
 	}

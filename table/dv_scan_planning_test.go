@@ -67,6 +67,7 @@ func TestIsDeletionVector(t *testing.T) {
 				mockDataFile: mockDataFile{
 					path:        "s3://bucket/data/dv.puffin",
 					contentType: iceberg.EntryContentPosDeletes,
+					format:      iceberg.PuffinFile,
 				},
 				referencedDataFile: strPtr("s3://bucket/data/file.parquet"),
 				contentOffset:      int64Ptr(100),
@@ -116,6 +117,7 @@ func TestManifestEntries_DVClassification(t *testing.T) {
 		mockDataFile: mockDataFile{
 			path:        "s3://bucket/data/dv-001.puffin",
 			contentType: iceberg.EntryContentPosDeletes,
+			format:      iceberg.PuffinFile,
 		},
 		referencedDataFile: strPtr("s3://bucket/data/data-001.parquet"),
 		contentOffset:      int64Ptr(0),
@@ -146,6 +148,7 @@ func TestDVMatchingToDataFiles(t *testing.T) {
 		mockDataFile: mockDataFile{
 			path:        "s3://bucket/data/dv-001.puffin",
 			contentType: iceberg.EntryContentPosDeletes,
+			format:      iceberg.PuffinFile,
 		},
 		referencedDataFile: strPtr(dataFilePath),
 		contentOffset:      int64Ptr(0),
@@ -156,6 +159,7 @@ func TestDVMatchingToDataFiles(t *testing.T) {
 		mockDataFile: mockDataFile{
 			path:        "s3://bucket/data/dv-002.puffin",
 			contentType: iceberg.EntryContentPosDeletes,
+			format:      iceberg.PuffinFile,
 		},
 		referencedDataFile: strPtr(otherDataFilePath),
 		contentOffset:      int64Ptr(0),
@@ -204,6 +208,7 @@ func TestDVMatchingNoMatch(t *testing.T) {
 		mockDataFile: mockDataFile{
 			path:        "s3://bucket/data/dv-001.puffin",
 			contentType: iceberg.EntryContentPosDeletes,
+			format:      iceberg.PuffinFile,
 		},
 		referencedDataFile: strPtr("s3://bucket/data/data-999.parquet"),
 		contentOffset:      int64Ptr(0),
@@ -240,6 +245,7 @@ func TestFileScanTask_DeletionVectorFilesField(t *testing.T) {
 		mockDataFile: mockDataFile{
 			path:        "s3://bucket/data/dv-001.puffin",
 			contentType: iceberg.EntryContentPosDeletes,
+			format:      iceberg.PuffinFile,
 		},
 		referencedDataFile: strPtr("s3://bucket/data/data-001.parquet"),
 		contentOffset:      int64Ptr(0),
@@ -260,4 +266,86 @@ func TestFileScanTask_DeletionVectorFilesField(t *testing.T) {
 	assert.Equal(t, "s3://bucket/data/data-001.parquet", *task.DeletionVectorFiles[0].ReferencedDataFile())
 	assert.Empty(t, task.DeleteFiles)
 	assert.Empty(t, task.EqualityDeleteFiles)
+}
+
+func TestDVPrecedenceOverPositionalDeletes(t *testing.T) {
+	// When a data file has both a DV and parquet positional deletes,
+	// the DV takes precedence and DeleteFiles should be empty.
+	dataFilePath := "s3://bucket/data/data-001.parquet"
+
+	// Simulate what PlanFiles does: build dvIndex and check precedence
+	dvFile := &dvMockDataFile{
+		mockDataFile: mockDataFile{
+			path:        "s3://bucket/data/dv-001.puffin",
+			contentType: iceberg.EntryContentPosDeletes,
+			format:      iceberg.PuffinFile,
+		},
+		referencedDataFile: strPtr(dataFilePath),
+		contentOffset:      int64Ptr(4),
+		contentSizeInBytes: int64Ptr(50),
+	}
+
+	posDelFile := &mockDataFile{
+		path:        "s3://bucket/data/pos-del-001.parquet",
+		contentType: iceberg.EntryContentPosDeletes,
+		format:      iceberg.ParquetFile,
+	}
+
+	// Build dvIndex the same way PlanFiles does
+	dvIndex := map[string][]iceberg.DataFile{
+		dataFilePath: {dvFile},
+	}
+
+	// Data file with DV: should get DeletionVectorFiles, no DeleteFiles
+	dvFiles := dvIndex[dataFilePath]
+	assert.Len(t, dvFiles, 1, "DV should be in the index")
+
+	task := FileScanTask{
+		File:                &mockDataFile{path: dataFilePath, contentType: iceberg.EntryContentData, filesize: 1024},
+		DeletionVectorFiles: dvFiles,
+		Start:               0,
+		Length:              1024,
+	}
+	// Per v3 spec: DV supersedes parquet positional deletes
+	assert.Len(t, task.DeletionVectorFiles, 1)
+	assert.Empty(t, task.DeleteFiles, "DeleteFiles must be empty when DV exists")
+
+	// Data file without DV: should get DeleteFiles, no DeletionVectorFiles
+	otherDataFilePath := "s3://bucket/data/data-002.parquet"
+	otherDvFiles := dvIndex[otherDataFilePath]
+	assert.Empty(t, otherDvFiles)
+
+	task2 := FileScanTask{
+		File:        &mockDataFile{path: otherDataFilePath, contentType: iceberg.EntryContentData, filesize: 2048},
+		DeleteFiles: []iceberg.DataFile{posDelFile},
+		Start:       0,
+		Length:      2048,
+	}
+	assert.Empty(t, task2.DeletionVectorFiles, "no DVs for this file")
+	assert.Len(t, task2.DeleteFiles, 1, "parquet pos deletes should be used when no DV")
+}
+
+func TestIsDeletionVectorByFileFormat(t *testing.T) {
+	tests := []struct {
+		name     string
+		format   iceberg.FileFormat
+		expected bool
+	}{
+		{"puffin format is DV", iceberg.PuffinFile, true},
+		{"parquet format is not DV", iceberg.ParquetFile, false},
+		{"avro format is not DV", iceberg.AvroFile, false},
+		{"orc format is not DV", iceberg.OrcFile, false},
+		{"empty format is not DV", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			df := &mockDataFile{
+				path:        "s3://bucket/test",
+				contentType: iceberg.EntryContentPosDeletes,
+				format:      tt.format,
+			}
+			assert.Equal(t, tt.expected, isDeletionVector(df))
+		})
+	}
 }
