@@ -19,7 +19,6 @@ package table
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"iter"
 	"strconv"
@@ -48,13 +47,15 @@ var PositionalDeleteArrowSchema, _ = SchemaToArrowSchema(iceberg.PositionalDelet
 type (
 	positionDeletes   = []*arrow.Chunked
 	perFilePosDeletes = map[string]positionDeletes
+	perFileDVDeletes  = map[string]*RoaringPositionBitmap
 )
 
-func readAllDeleteFiles(ctx context.Context, fs iceio.IO, tasks []FileScanTask, concurrency int) (perFilePosDeletes, error) {
+func readAllDeleteFiles(ctx context.Context, fs iceio.IO, tasks []FileScanTask, concurrency int) (perFilePosDeletes, perFileDVDeletes, error) {
 	var (
-		deletesPerFile = make(perFilePosDeletes)
-		uniqueDeletes  = make(map[string]iceberg.DataFile)
-		err            error
+		deletesPerFile       = make(perFilePosDeletes)
+		dvDeletesPerFile     = make(perFileDVDeletes)
+		uniqueParquetDeletes = make(map[string]iceberg.DataFile)
+		uniqueDVDeletes      = make(map[string]iceberg.DataFile)
 	)
 
 	for _, t := range tasks {
@@ -63,43 +64,105 @@ func readAllDeleteFiles(ctx context.Context, fs iceio.IO, tasks []FileScanTask, 
 				continue
 			}
 
-			if _, ok := uniqueDeletes[d.FilePath()]; !ok {
-				uniqueDeletes[d.FilePath()] = d
+			if _, ok := uniqueParquetDeletes[d.FilePath()]; !ok {
+				uniqueParquetDeletes[d.FilePath()] = d
+			}
+		}
+
+		for _, d := range t.DeletionVectorFiles {
+			ref := d.ReferencedDataFile()
+			if ref == nil {
+				continue
+			}
+			key := d.FilePath() + ":" + *ref
+			if _, ok := uniqueDVDeletes[key]; !ok {
+				uniqueDVDeletes[key] = d
 			}
 		}
 	}
 
-	if len(uniqueDeletes) == 0 {
-		return deletesPerFile, nil
+	if len(uniqueParquetDeletes) == 0 && len(uniqueDVDeletes) == 0 {
+		return deletesPerFile, dvDeletesPerFile, nil
 	}
 
-	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(concurrency)
+	// Read parquet deletes concurrently
+	if len(uniqueParquetDeletes) > 0 {
+		var parquetErr error
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(concurrency)
 
-	perFileChan := make(chan map[string]*arrow.Chunked, concurrency)
-	go func() {
-		defer close(perFileChan)
-		for _, v := range uniqueDeletes {
-			g.Go(func() error {
-				deletes, err := readDeletes(ctx, fs, v)
-				if deletes != nil {
-					perFileChan <- deletes
-				}
+		perFileChan := make(chan map[string]*arrow.Chunked, concurrency)
+		go func() {
+			defer close(perFileChan)
+			for _, v := range uniqueParquetDeletes {
+				g.Go(func() error {
+					deletes, err := readDeletes(gctx, fs, v)
+					if deletes != nil {
+						perFileChan <- deletes
+					}
 
-				return err
-			})
+					return err
+				})
+			}
+
+			parquetErr = g.Wait()
+		}()
+
+		for deletes := range perFileChan {
+			for file, arr := range deletes {
+				deletesPerFile[file] = append(deletesPerFile[file], arr)
+			}
 		}
 
-		err = g.Wait()
-	}()
-
-	for deletes := range perFileChan {
-		for file, arr := range deletes {
-			deletesPerFile[file] = append(deletesPerFile[file], arr)
+		if parquetErr != nil {
+			return nil, nil, parquetErr
 		}
 	}
 
-	return deletesPerFile, err
+	// Read DV deletes concurrently
+	if len(uniqueDVDeletes) > 0 {
+		type dvResult struct {
+			ref    string
+			bitmap *RoaringPositionBitmap
+		}
+
+		var dvErr error
+		g, _ := errgroup.WithContext(ctx)
+		g.SetLimit(concurrency)
+
+		dvChan := make(chan dvResult, concurrency)
+		go func() {
+			defer close(dvChan)
+			for _, v := range uniqueDVDeletes {
+				g.Go(func() error {
+					bitmap, err := ReadDV(fs, v)
+					if err != nil {
+						return err
+					}
+
+					dvChan <- dvResult{ref: *v.ReferencedDataFile(), bitmap: bitmap}
+
+					return nil
+				})
+			}
+
+			dvErr = g.Wait()
+		}()
+
+		for dv := range dvChan {
+			if existing, ok := dvDeletesPerFile[dv.ref]; ok {
+				existing.SetAll(dv.bitmap)
+			} else {
+				dvDeletesPerFile[dv.ref] = dv.bitmap
+			}
+		}
+
+		if dvErr != nil {
+			return nil, nil, dvErr
+		}
+	}
+
+	return deletesPerFile, dvDeletesPerFile, nil
 }
 
 func readDeletes(ctx context.Context, fs iceio.IO, dataFile iceberg.DataFile) (_ map[string]*arrow.Chunked, err error) {
@@ -451,7 +514,7 @@ func (as *arrowScan) processRecords(
 	return err
 }
 
-func (as *arrowScan) recordsFromTask(ctx context.Context, task internal.Enumerated[FileScanTask], out chan<- enumeratedRecord, positionalDeletes positionDeletes, eqDeleteSets []*equalityDeleteSet) (err error) {
+func (as *arrowScan) recordsFromTask(ctx context.Context, task internal.Enumerated[FileScanTask], out chan<- enumeratedRecord, positionalDeletes positionDeletes, dvBitmap *RoaringPositionBitmap, eqDeleteSets []*equalityDeleteSet) (err error) {
 	defer func() {
 		if err != nil {
 			out <- enumeratedRecord{Task: task, Err: err}
@@ -473,14 +536,27 @@ func (as *arrowScan) recordsFromTask(ctx context.Context, task internal.Enumerat
 	defer iceinternal.CheckedClose(rdr, &err)
 
 	pipeline := make([]recProcessFn, 0, 2)
-	if len(positionalDeletes) > 0 {
+
+	hasPosDeletes := len(positionalDeletes) > 0
+	hasDVDeletes := dvBitmap != nil && !dvBitmap.IsEmpty()
+
+	if hasPosDeletes || hasDVDeletes {
 		deletes := set[int64]{}
-		for _, chunk := range positionalDeletes {
-			for _, a := range chunk.Chunks() {
-				for _, v := range a.(*array.Int64).Int64Values() {
-					deletes[v] = struct{}{}
+
+		if hasPosDeletes {
+			for _, chunk := range positionalDeletes {
+				for _, a := range chunk.Chunks() {
+					for _, v := range a.(*array.Int64).Int64Values() {
+						deletes[v] = struct{}{}
+					}
 				}
 			}
+		}
+
+		if hasDVDeletes {
+			dvBitmap.ForEach(func(pos int64) {
+				deletes[pos] = struct{}{}
+			})
 		}
 
 		pipeline = append(pipeline, processPositionalDeletes(ctx, deletes))
@@ -700,7 +776,7 @@ func createIterator(ctx context.Context, numWorkers uint, records <-chan enumera
 	}
 }
 
-func (as *arrowScan) recordBatchesFromTasksAndDeletes(ctx context.Context, tasks []FileScanTask, deletesPerFile perFilePosDeletes, eqDeleteSets map[int][]*equalityDeleteSet) iter.Seq2[arrow.RecordBatch, error] {
+func (as *arrowScan) recordBatchesFromTasksAndDeletes(ctx context.Context, tasks []FileScanTask, deletesPerFile perFilePosDeletes, dvDeletesPerFile perFileDVDeletes, eqDeleteSets map[int][]*equalityDeleteSet) iter.Seq2[arrow.RecordBatch, error] {
 	extSet := substrait.NewExtensionSet()
 	as.nameMapping = as.metadata.NameMapping()
 
@@ -727,6 +803,7 @@ func (as *arrowScan) recordBatchesFromTasksAndDeletes(ctx context.Context, tasks
 
 					if err := as.recordsFromTask(ctx, task, records,
 						deletesPerFile[task.Value.File.FilePath()],
+						dvDeletesPerFile[task.Value.File.FilePath()],
 						eqDeleteSets[task.Index]); err != nil {
 						cancel(err)
 
@@ -754,14 +831,6 @@ func (as *arrowScan) recordBatchesFromTasksAndDeletes(ctx context.Context, tasks
 }
 
 func (as *arrowScan) GetRecords(ctx context.Context, tasks []FileScanTask) (*arrow.Schema, iter.Seq2[arrow.RecordBatch, error], error) {
-	for _, t := range tasks {
-		if len(t.DeletionVectorFiles) > 0 {
-			return nil, nil, fmt.Errorf(
-				"%w: deletion vector read is not yet implemented, data file: %s has %d deletion vector(s)",
-				iceberg.ErrNotImplemented, t.File.FilePath(), len(t.DeletionVectorFiles))
-		}
-	}
-
 	var err error
 	as.useLargeTypes, err = strconv.ParseBool(as.options.Get(ScanOptionArrowUseLargeTypes, "false"))
 	if err != nil {
@@ -779,7 +848,7 @@ func (as *arrowScan) GetRecords(ctx context.Context, tasks []FileScanTask) (*arr
 		return resultSchema, func(yield func(arrow.RecordBatch, error) bool) {}, nil
 	}
 
-	deletesPerFile, err := readAllDeleteFiles(ctx, as.fs, tasks, as.concurrency)
+	deletesPerFile, dvDeletesPerFile, err := readAllDeleteFiles(ctx, as.fs, tasks, as.concurrency)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -790,5 +859,5 @@ func (as *arrowScan) GetRecords(ctx context.Context, tasks []FileScanTask) (*arr
 		return nil, nil, err
 	}
 
-	return resultSchema, as.recordBatchesFromTasksAndDeletes(ctx, tasks, deletesPerFile, eqDeleteSets), nil
+	return resultSchema, as.recordBatchesFromTasksAndDeletes(ctx, tasks, deletesPerFile, dvDeletesPerFile, eqDeleteSets), nil
 }

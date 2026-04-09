@@ -47,26 +47,28 @@ const (
 //   - Bitmap (variable): roaring bitmap in Iceberg portable format
 //   - CRC-32 (4 bytes, big-endian): checksum over magic + bitmap
 //
+// Blob [ [length] [Magic] [Bitmap] [CRC-32] ]
+//
 // If expectedCardinality >= 0, the bitmap's cardinality is validated against it.
 func DeserializeDV(data []byte, expectedCardinality int64) (*RoaringPositionBitmap, error) {
 	if len(data) < dvMinSize {
 		return nil, fmt.Errorf("deletion vector payload too short: %d bytes (minimum %d)", len(data), dvMinSize)
 	}
 
-	// 1. Read and validate length
+	// Read and validate length
 	length := binary.BigEndian.Uint32(data[0:dvLengthSize])
 	expectedLength := uint32(len(data) - dvLengthSize - dvCRCSize)
 	if length != expectedLength {
 		return nil, fmt.Errorf("deletion vector length mismatch: got %d, expected %d", length, expectedLength)
 	}
 
-	// 2. Read and validate magic
+	// Read and validate magic
 	magic := binary.LittleEndian.Uint32(data[dvLengthSize : dvLengthSize+dvMagicSize])
 	if magic != DVMagicNumber {
 		return nil, fmt.Errorf("invalid deletion vector magic: 0x%08x, expected 0x%08x", magic, DVMagicNumber)
 	}
 
-	// 3. Verify CRC-32 over magic + bitmap (bytes 4 to len-4)
+	// Verify CRC-32 over magic + bitmap (bytes 4 to len-4)
 	bitmapDataStart := dvLengthSize
 	bitmapDataEnd := len(data) - dvCRCSize
 	computedCRC := crc32.ChecksumIEEE(data[bitmapDataStart:bitmapDataEnd])
@@ -75,14 +77,14 @@ func DeserializeDV(data []byte, expectedCardinality int64) (*RoaringPositionBitm
 		return nil, fmt.Errorf("deletion vector CRC mismatch: computed 0x%08x, expected 0x%08x", computedCRC, expectedCRC)
 	}
 
-	// 4. Deserialize roaring bitmap from the inner bytes (after length + magic, before CRC)
+	// Deserialize roaring bitmap from the inner bytes (after length + magic, before CRC)
 	roaringStart := dvLengthSize + dvMagicSize
 	bitmap, err := DeserializeRoaringPositionBitmap(bytes.NewReader(data[roaringStart:bitmapDataEnd]))
 	if err != nil {
 		return nil, fmt.Errorf("deserialize deletion vector bitmap: %w", err)
 	}
 
-	// 5. Validate cardinality if requested
+	// Validate cardinality
 	if expectedCardinality >= 0 {
 		actual := bitmap.Cardinality()
 		if actual != expectedCardinality {

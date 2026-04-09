@@ -179,7 +179,7 @@ func openManifest(io io.IO, manifest iceberg.ManifestFile,
 }
 
 func isDeletionVector(df iceberg.DataFile) bool {
-	return df.ReferencedDataFile() != nil
+	return df.FileFormat() == iceberg.PuffinFile
 }
 
 type Scan struct {
@@ -556,18 +556,25 @@ func (scan *Scan) PlanFiles(ctx context.Context) ([]FileScanTask, error) {
 
 	results := make([]FileScanTask, 0, len(entries.dataEntries))
 	for _, e := range entries.dataEntries {
-		deleteFiles, err := matchDeletesToData(e, entries.positionalDeleteEntries)
-		if err != nil {
-			return nil, err
-		}
-
 		eqDeleteFiles := matchEqualityDeletesToData(e, entries.equalityDeleteEntries)
+		dvFiles := dvIndex[e.DataFile().FilePath()]
+
+		// Per v3 spec: if a DV exists for this data file, it already contains
+		// all positions from existing positional delete files. Skip parquet deletes.
+		var deleteFiles []iceberg.DataFile
+		if len(dvFiles) == 0 {
+			var err error
+			deleteFiles, err = matchDeletesToData(e, entries.positionalDeleteEntries)
+			if err != nil {
+				return nil, err
+			}
+		}
 
 		results = append(results, FileScanTask{
 			File:                e.DataFile(),
 			DeleteFiles:         deleteFiles,
 			EqualityDeleteFiles: eqDeleteFiles,
-			DeletionVectorFiles: dvIndex[e.DataFile().FilePath()],
+			DeletionVectorFiles: dvFiles,
 			Start:               0,
 			Length:              e.DataFile().FileSizeBytes(),
 		})
