@@ -80,6 +80,11 @@ type FileWriter interface {
 	Write(arrow.RecordBatch) error
 	BytesWritten() int64
 	Close() (iceberg.DataFile, error)
+	// Abort closes the underlying file handle without finalizing the
+	// file format (e.g. Parquet footer). It is safe to call regardless
+	// of how many rows have been written and should be used on error
+	// paths where Close() may panic or produce an invalid file.
+	Abort() error
 }
 
 type FileFormat interface {
@@ -117,6 +122,7 @@ type WriteFileInfo struct {
 	WriteProps       any
 	Content          iceberg.ManifestEntryContent
 	EqualityFieldIDs []int
+	SortOrderID      int
 }
 
 type tablePropertiesContextKey struct{}

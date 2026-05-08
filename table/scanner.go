@@ -153,13 +153,13 @@ func GetPartitionRecord(dataFile iceberg.DataFile, partitionType *iceberg.Struct
 func openManifest(io io.IO, manifest iceberg.ManifestFile,
 	partitionFilter, metricsEval func(iceberg.DataFile) (bool, error),
 ) ([]iceberg.ManifestEntry, error) {
-	entries, err := manifest.FetchEntries(io, true)
-	if err != nil {
-		return nil, err
-	}
+	// Counts may be -1 (unset) on V1 manifests, so clamp before allocating.
+	out := make([]iceberg.ManifestEntry, 0, max(0, int(manifest.AddedDataFiles())+int(manifest.ExistingDataFiles())))
+	for entry, err := range manifest.Entries(io, true) {
+		if err != nil {
+			return nil, err
+		}
 
-	out := make([]iceberg.ManifestEntry, 0, len(entries))
-	for _, entry := range entries {
 		p, err := partitionFilter(entry.DataFile())
 		if err != nil {
 			return nil, err
@@ -294,15 +294,18 @@ func buildManifestEvaluator(specID int, metadata Metadata, partitionFilters *key
 }
 
 func (scan *Scan) buildPartitionEvaluator(specID int) (func(iceberg.DataFile) (bool, error), error) {
-	spec := scan.metadata.PartitionSpecByID(specID)
+	return buildPartitionEvaluator(specID, scan.metadata, scan.partitionFilters, scan.caseSensitive)
+}
+
+func buildPartitionEvaluator(specID int, metadata Metadata, partitionFilters *keyDefaultMap[int, iceberg.BooleanExpression], caseSensitive bool) (func(iceberg.DataFile) (bool, error), error) {
+	spec := metadata.PartitionSpecByID(specID)
 	if spec == nil {
 		return nil, fmt.Errorf("%w: id %d", ErrPartitionSpecNotFound, specID)
 	}
-	partType := spec.PartitionType(scan.metadata.CurrentSchema())
+	partType := spec.PartitionType(metadata.CurrentSchema())
 	partSchema := iceberg.NewSchema(0, partType.FieldList...)
-	partExpr := scan.partitionFilters.Get(specID)
 
-	fn, err := iceberg.ExpressionEvaluator(partSchema, partExpr, scan.caseSensitive)
+	fn, err := iceberg.ExpressionEvaluator(partSchema, partitionFilters.Get(specID), caseSensitive)
 	if err != nil {
 		return nil, err
 	}
@@ -560,17 +563,23 @@ func (scan *Scan) PlanFiles(ctx context.Context) ([]FileScanTask, error) {
 		if err != nil {
 			return nil, err
 		}
-
 		eqDeleteFiles := matchEqualityDeletesToData(e, entries.equalityDeleteEntries)
 
-		results = append(results, FileScanTask{
+		task := FileScanTask{
 			File:                e.DataFile(),
 			DeleteFiles:         deleteFiles,
 			EqualityDeleteFiles: eqDeleteFiles,
 			DeletionVectorFiles: dvIndex[e.DataFile().FilePath()],
 			Start:               0,
 			Length:              e.DataFile().FileSizeBytes(),
-		})
+		}
+		// Row lineage constants: readers use these to synthesize _row_id and
+		// _last_updated_sequence_number when requested.
+		task.FirstRowID = e.DataFile().FirstRowID()
+		if fseq := e.FileSequenceNum(); fseq != nil {
+			task.DataSequenceNumber = fseq
+		}
+		results = append(results, task)
 	}
 
 	return results, nil
@@ -582,6 +591,12 @@ type FileScanTask struct {
 	EqualityDeleteFiles []iceberg.DataFile // equality delete files
 	DeletionVectorFiles []iceberg.DataFile // deletion vectors (puffin files)
 	Start, Length       int64
+
+	// Row lineage (v3): constants used when reading to synthesize _row_id and _last_updated_sequence_number.
+	// FirstRowID is the effective first_row_id for this file (from manifest entry, after inheritance).
+	// DataSequenceNumber is the data sequence number of the file's manifest entry.
+	FirstRowID         *int64
+	DataSequenceNumber *int64
 }
 
 // ToArrowRecords returns the arrow schema of the expected records and an interator

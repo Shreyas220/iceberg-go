@@ -18,7 +18,9 @@
 package table
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"path"
 	"slices"
@@ -29,6 +31,7 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
+	"github.com/klauspost/compress/zstd"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1796,4 +1799,58 @@ func getTestTableMetadata(fileName string) (Metadata, error) {
 	}
 
 	return meta, nil
+}
+
+func TestV3PartitionStatisticsRoundTrip(t *testing.T) {
+	const testFile = "TableMetadataV3WithPartitionStatistics.json"
+
+	raw, err := os.ReadFile(path.Join("testdata", testFile))
+	require.NoError(t, err)
+
+	meta, err := ParseMetadataBytes(raw)
+	require.NoError(t, err)
+	require.Equal(t, 3, meta.Version())
+
+	partStats := slices.Collect(meta.PartitionStatistics())
+	require.Len(t, partStats, 2)
+
+	assert.Equal(t, int64(3051729675574597004), partStats[0].SnapshotID)
+	assert.Equal(t, "s3://bucket/test/location/metadata/partition-stats/snap-3051729675574597004.parquet", partStats[0].StatisticsPath)
+	assert.Equal(t, int64(42330), partStats[0].FileSizeInBytes)
+
+	assert.Equal(t, int64(3055729675574597004), partStats[1].SnapshotID)
+	assert.Equal(t, "s3://bucket/test/location/metadata/partition-stats/snap-3055729675574597004.parquet", partStats[1].StatisticsPath)
+	assert.Equal(t, int64(65871), partStats[1].FileSizeInBytes)
+
+	serialized, err := json.Marshal(meta)
+	require.NoError(t, err)
+
+	reparsed, err := ParseMetadataBytes(serialized)
+	require.NoError(t, err)
+
+	roundTripStats := slices.Collect(reparsed.PartitionStatistics())
+	require.Len(t, roundTripStats, 2)
+	assert.Equal(t, partStats, roundTripStats)
+
+	assert.JSONEq(t, string(raw), string(serialized))
+}
+
+func TestZstdGoldenFixture(t *testing.T) {
+	compressed, err := os.ReadFile(path.Join("testdata", "TableMetadataV2Valid.zstd.metadata.json"))
+	require.NoError(t, err)
+
+	dec, err := zstd.NewReader(bytes.NewReader(compressed))
+	require.NoError(t, err)
+	defer dec.Close()
+
+	data, err := io.ReadAll(dec)
+	require.NoError(t, err)
+
+	meta, err := ParseMetadataBytes(data)
+	require.NoError(t, err)
+
+	expected, err := getTestTableMetadata("TableMetadataV2ValidMinimal.json")
+	require.NoError(t, err)
+
+	assert.True(t, expected.Equals(meta))
 }

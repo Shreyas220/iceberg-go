@@ -20,14 +20,19 @@ package rest
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -226,6 +231,135 @@ func TestOAuthTokenRequestParams(t *testing.T) {
 			assert.NotNil(t, cat)
 		})
 	}
+}
+
+func TestOAuthTLSConfig(t *testing.T) {
+	t.Parallel()
+
+	// Helper that returns a config endpoint handler.
+	configHandler := func(w http.ResponseWriter, _ *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"defaults": map[string]any{}, "overrides": map[string]any{},
+		})
+	}
+
+	// Helper that returns an oauth token endpoint handler.
+	tokenHandler := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "tok",
+			"token_type":   "Bearer",
+			"expires_in":   86400,
+		})
+	}
+
+	// generateTLSCert creates a self-signed CA and leaf certificate for
+	// use with an httptest server. The returned tls.Certificate can be
+	// assigned to the server's TLS config, and the CA cert can be added
+	// to a client's root CA pool.
+	generateTLSCert := func(t *testing.T) (tls.Certificate, *x509.Certificate) {
+		t.Helper()
+
+		// Generate a CA key pair.
+		caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		require.NoError(t, err)
+
+		caTemplate := &x509.Certificate{
+			SerialNumber:          big.NewInt(1),
+			NotBefore:             time.Now(),
+			NotAfter:              time.Now().Add(time.Hour),
+			KeyUsage:              x509.KeyUsageCertSign,
+			BasicConstraintsValid: true,
+			IsCA:                  true,
+		}
+		caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+		require.NoError(t, err)
+		caCert, err := x509.ParseCertificate(caDER)
+		require.NoError(t, err)
+
+		// Generate a leaf certificate signed by this CA.
+		leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		require.NoError(t, err)
+
+		leafTemplate := &x509.Certificate{
+			SerialNumber: big.NewInt(2),
+			NotBefore:    time.Now(),
+			NotAfter:     time.Now().Add(time.Hour),
+			KeyUsage:     x509.KeyUsageDigitalSignature,
+			ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+			IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1)},
+		}
+		leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, caCert, &leafKey.PublicKey, caKey)
+		require.NoError(t, err)
+
+		tlsCert := tls.Certificate{
+			Certificate: [][]byte{leafDER},
+			PrivateKey:  leafKey,
+		}
+
+		return tlsCert, caCert
+	}
+
+	// startTLSServer creates an httptest server using the provided
+	// certificate instead of the default shared one.
+	startTLSServer := func(handler http.Handler, cert tls.Certificate) *httptest.Server {
+		srv := httptest.NewUnstartedServer(handler)
+		srv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+		srv.StartTLS()
+
+		return srv
+	}
+
+	catalogCert, catalogCA := generateTLSCert(t)
+	oauthCert, oauthCA := generateTLSCert(t)
+
+	catalogMux := http.NewServeMux()
+	catalogMux.HandleFunc("/v1/config", configHandler)
+	catalogSrv := startTLSServer(catalogMux, catalogCert)
+	t.Cleanup(catalogSrv.Close)
+
+	oauthMux := http.NewServeMux()
+	oauthMux.HandleFunc("/oauth/tokens", tokenHandler)
+	oauthSrv := startTLSServer(oauthMux, oauthCert)
+	t.Cleanup(oauthSrv.Close)
+
+	authURI, err := url.Parse(oauthSrv.URL + "/oauth/tokens")
+	require.NoError(t, err)
+
+	catalogPool := x509.NewCertPool()
+	catalogPool.AddCert(catalogCA)
+	oauthPool := x509.NewCertPool()
+	oauthPool.AddCert(oauthCA)
+
+	t.Run("separate oauth tls config", func(t *testing.T) {
+		t.Parallel()
+
+		// Each TLS config trusts only its respective server.
+		cat, err := NewCatalog(context.Background(), "rest", catalogSrv.URL,
+			WithCredential("secret"),
+			WithAuthURI(authURI),
+			WithTLSConfig(&tls.Config{RootCAs: catalogPool}),
+			WithOAuthTLSConfig(&tls.Config{RootCAs: oauthPool}),
+		)
+		require.NoError(t, err)
+		assert.NotNil(t, cat)
+	})
+
+	t.Run("fails without separate oauth tls config", func(t *testing.T) {
+		t.Parallel()
+
+		// Only the catalog TLS config is set — the OAuth token request
+		// should fail because the catalog's CA doesn't trust the OAuth
+		// server's certificate.
+		_, err := NewCatalog(context.Background(), "rest", catalogSrv.URL,
+			WithCredential("secret"),
+			WithAuthURI(authURI),
+			WithTLSConfig(&tls.Config{RootCAs: catalogPool}),
+		)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrOAuthError)
+		assert.Contains(t, err.Error(), "ECDSA verification failure")
+	})
 }
 
 func TestAuthHeader(t *testing.T) {
@@ -702,5 +836,149 @@ func TestResponseBodyLeak(t *testing.T) {
 
 		assert.True(t, tracker.body.closed,
 			"response body should be closed on non-200 status")
+	})
+}
+
+func TestHandleNon200_DecodeFlatMessagePreservesSentinel(t *testing.T) {
+	rsp := &http.Response{
+		StatusCode:    http.StatusBadRequest,
+		ContentLength: int64(len(`{"message":"flat error"}`)),
+		Body:          io.NopCloser(bytes.NewBufferString(`{"message":"flat error"}`)),
+	}
+
+	err := handleNon200(rsp, nil)
+	require.Error(t, err)
+	require.Equal(t, "flat error", err.Error())
+	require.True(t, errors.Is(err, ErrBadRequest))
+}
+
+func TestHandleNon200_DecodeCanonicalErrorRendersExpectedMessage(t *testing.T) {
+	rsp := &http.Response{
+		StatusCode:    http.StatusForbidden,
+		ContentLength: int64(len(`{"error":{"message":"nested error","type":"ValidationException"}}`)),
+		Body:          io.NopCloser(bytes.NewBufferString(`{"error":{"message":"nested error","type":"ValidationException"}}`)),
+	}
+
+	err := handleNon200(rsp, nil)
+	require.Error(t, err)
+	require.Equal(t, "ValidationException: nested error", err.Error())
+	require.True(t, errors.Is(err, ErrForbidden))
+}
+
+func TestHandleNon200_EmptyBodyFallback(t *testing.T) {
+	rsp := &http.Response{
+		StatusCode:    http.StatusBadRequest,
+		ContentLength: 0,
+		Body:          http.NoBody,
+	}
+
+	err := handleNon200(rsp, nil)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrBadRequest))
+	require.Equal(t, ErrBadRequest.Error(), err.Error())
+	require.NotEqual(t, ": ", err.Error())
+}
+
+func TestErrorResponse_ErrorFormattingTypeAndMessage(t *testing.T) {
+	err := errorResponse{Type: "ValidationException", Message: "bad request"}
+	require.Equal(t, "ValidationException: bad request", err.Error())
+}
+
+func TestErrorResponse_ErrorFormattingMessageOnly(t *testing.T) {
+	err := errorResponse{Message: "bad request"}
+	require.Equal(t, "bad request", err.Error())
+}
+
+func TestErrorResponse_ErrorFormattingTypeOnly(t *testing.T) {
+	err := errorResponse{Type: "ValidationException"}
+	require.Equal(t, "ValidationException", err.Error())
+}
+
+func TestErrorResponse_ErrorFormattingWrappingOnly(t *testing.T) {
+	err := errorResponse{wrapping: ErrServerError}
+	require.Equal(t, ErrServerError.Error(), err.Error())
+}
+
+func TestErrorResponse_ErrorFormattingEmpty(t *testing.T) {
+	err := errorResponse{}
+	require.Equal(t, "unknown REST error", err.Error())
+}
+
+func TestToPropsSigv4RegionFallback(t *testing.T) {
+	t.Parallel()
+
+	t.Run("sigv4 region propagated as client.region for s3tables", func(t *testing.T) {
+		t.Parallel()
+
+		opts := &options{
+			enableSigv4:  true,
+			sigv4Region:  "us-east-1",
+			sigv4Service: "s3tables",
+		}
+		props := toProps(opts)
+		assert.Equal(t, "us-east-1", props["client.region"])
+	})
+
+	t.Run("sigv4 region propagated as client.region for s3", func(t *testing.T) {
+		t.Parallel()
+
+		opts := &options{
+			enableSigv4:  true,
+			sigv4Region:  "us-west-2",
+			sigv4Service: "s3",
+		}
+		props := toProps(opts)
+		assert.Equal(t, "us-west-2", props["client.region"])
+	})
+
+	t.Run("sigv4 region not propagated for non-s3 service", func(t *testing.T) {
+		t.Parallel()
+
+		opts := &options{
+			enableSigv4:  true,
+			sigv4Region:  "us-east-1",
+			sigv4Service: "execute-api",
+		}
+		props := toProps(opts)
+		_, ok := props["client.region"]
+		assert.False(t, ok)
+	})
+
+	t.Run("sigv4 region does not overwrite existing client.region", func(t *testing.T) {
+		t.Parallel()
+
+		opts := &options{
+			enableSigv4:  true,
+			sigv4Region:  "us-east-1",
+			sigv4Service: "s3tables",
+			additionalProps: map[string]string{
+				"client.region": "eu-west-1",
+			},
+		}
+		props := toProps(opts)
+		assert.Equal(t, "eu-west-1", props["client.region"])
+	})
+
+	t.Run("no client.region when sigv4 disabled", func(t *testing.T) {
+		t.Parallel()
+
+		opts := &options{
+			sigv4Region: "us-east-1",
+		}
+		props := toProps(opts)
+		_, ok := props["client.region"]
+		assert.False(t, ok)
+	})
+
+	t.Run("no client.region when sigv4 region empty", func(t *testing.T) {
+		t.Parallel()
+
+		opts := &options{
+			enableSigv4:  true,
+			sigv4Service: "s3tables",
+		}
+		props := toProps(opts)
+		_, ok := props["client.region"]
+		assert.False(t, ok)
 	})
 }
